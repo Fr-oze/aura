@@ -1,0 +1,5 @@
+.build/
+Aura.app/
+*.bak
+*.bak-*
+.DS_Store

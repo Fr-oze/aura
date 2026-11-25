@@ -1,0 +1,115 @@
+#!/bin/bash
+# aura — poser une question à l'utilisateur dans l'encoche, depuis un agent.
+#
+#   aura ask "On part sur quelle option ?" --choix "Refaire,Garder"
+#   aura ask "Quel nom pour la branche ?" --texte
+#   aura ask "Quel fichier je lis ?" --fichier
+#   aura ask "Je pousse ?" --choix "Oui,Non" --detail "3 commits sur main" --delai 300
+#
+# Écrit la réponse sur la sortie standard.
+#   code 0 : réponse donnée
+#   code 1 : annulé, délai dépassé, ou question refusée
+#   code 2 : Aura ne tourne pas
+set -euo pipefail
+
+PORT="${AURA_PORT:-47823}"
+[ -f "$HOME/.aura/config.sh" ] && . "$HOME/.aura/config.sh" 2>/dev/null || true
+PORT="${AURA_PORT:-$PORT}"
+
+usage() {
+  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+[ "$#" -ge 1 ] || usage 2
+case "$1" in
+  ask) shift ;;
+  -h|--help) usage 0 ;;
+  *) echo "Commande inconnue : $1" >&2; usage 2 ;;
+esac
+
+QUESTION="${1:-}"
+[ -n "$QUESTION" ] || { echo "Il manque la question." >&2; usage 2; }
+shift || true
+
+CHOICES=""
+DETAIL=""
+WANT_TEXT=false
+WANT_FILE=false
+DELAY=180
+SOURCE="${AURA_SOURCE:-}"
+SESSION="${AURA_SESSION:-}"
+
+# Source devinée d'après l'agent qui tourne, si rien n'est forcé.
+if [ -z "$SOURCE" ]; then
+  if [ -n "${CLAUDE_PROJECT_DIR:-}" ] || [ -n "${CLAUDECODE:-}" ]; then
+    SOURCE="claude"
+  elif [ -n "${CODEX_HOME:-}" ] || [ -n "${CODEX_SANDBOX:-}" ]; then
+    SOURCE="codex"
+  elif [ -n "${CURSOR_TRACE_ID:-}" ]; then
+    SOURCE="cursor"
+  else
+    SOURCE="other"
+  fi
+fi
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --choix|--choices) CHOICES="${2:-}"; shift 2 ;;
+    --detail)          DETAIL="${2:-}"; shift 2 ;;
+    --texte|--text)    WANT_TEXT=true; shift ;;
+    --fichier|--file)  WANT_FILE=true; shift ;;
+    --delai|--timeout) DELAY="${2:-180}"; shift 2 ;;
+    --source)          SOURCE="${2:-other}"; shift 2 ;;
+    -h|--help)         usage 0 ;;
+    *) echo "Option inconnue : $1" >&2; usage 2 ;;
+  esac
+done
+
+# Un choix au moins, ou du texte, ou un fichier : sinon la question n'a pas de réponse possible.
+if [ -z "$CHOICES" ] && [ "$WANT_TEXT" = false ] && [ "$WANT_FILE" = false ]; then
+  CHOICES="Oui,Non"
+fi
+
+BODY=$(QUESTION="$QUESTION" DETAIL="$DETAIL" CHOICES="$CHOICES" \
+       WANT_TEXT="$WANT_TEXT" WANT_FILE="$WANT_FILE" DELAY="$DELAY" \
+       SOURCE="$SOURCE" SESSION="$SESSION" CWD="$PWD" python3 -I -c '
+import json, os
+choices = [c.strip() for c in os.environ["CHOICES"].split(",") if c.strip()]
+print(json.dumps({
+    "source": os.environ["SOURCE"],
+    "session": os.environ["SESSION"] or "default",
+    "cwd": os.environ["CWD"],
+    "question": os.environ["QUESTION"],
+    "detail": os.environ["DETAIL"],
+    "choices": choices,
+    "text": os.environ["WANT_TEXT"] == "true",
+    "file": os.environ["WANT_FILE"] == "true",
+    "timeout": float(os.environ["DELAY"]),
+}))')
+
+# Le serveur garde la connexion ouverte jusqu'à la réponse : le délai curl suit celui de la question.
+HTTP_TIMEOUT=$(python3 -I -c "print(int(float('$DELAY')) + 15)")
+RESPONSE=$(curl -s --max-time "$HTTP_TIMEOUT" \
+  -H 'Content-Type: application/json' \
+  --data-binary "$BODY" \
+  "http://127.0.0.1:$PORT/ask" 2>/dev/null) || {
+    echo "Aura ne répond pas sur 127.0.0.1:$PORT." >&2
+    exit 2
+  }
+
+[ -n "$RESPONSE" ] || { echo "Aura ne répond pas sur 127.0.0.1:$PORT." >&2; exit 2; }
+
+RESPONSE="$RESPONSE" python3 -I -c '
+import json, os, sys
+try:
+    data = json.loads(os.environ["RESPONSE"])
+except ValueError:
+    sys.stderr.write("Reponse illisible renvoyee par Aura.\n")
+    sys.exit(2)
+answer = data.get("answer")
+if answer is None:
+    sys.stderr.write("Question annulée ou délai dépassé.\n")
+    sys.exit(1)
+print(answer)
+'
